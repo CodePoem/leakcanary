@@ -38,13 +38,37 @@ public final class RefWatcher {
 
   public static final RefWatcher DISABLED = new RefWatcherBuilder<>().build();
 
+  /**
+   * 观察执行器
+   */
   private final WatchExecutor watchExecutor;
+  /**
+   * 调试控制
+   */
   private final DebuggerControl debuggerControl;
+  /**
+   * Gc触发器
+   */
   private final GcTrigger gcTrigger;
+  /**
+   * “堆转储”操作者
+   */
   private final HeapDumper heapDumper;
+  /**
+   * “堆转储“分析监听者
+   */
   private final HeapDump.Listener heapdumpListener;
+  /**
+   * “堆转储”信息建造者
+   */
   private final HeapDump.Builder heapDumpBuilder;
+  /**
+   * 留存的弱引用对象key
+   */
   private final Set<String> retainedKeys;
+  /**
+   * 弱引用对象队列
+   */
   private final ReferenceQueue<Object> queue;
 
   RefWatcher(WatchExecutor watchExecutor, DebuggerControl debuggerControl, GcTrigger gcTrigger,
@@ -81,12 +105,17 @@ public final class RefWatcher {
     }
     checkNotNull(watchedReference, "watchedReference");
     checkNotNull(referenceName, "referenceName");
+    // 记录开始观察时间（毫秒）
+    // System.nanoTime与System.currentTimeMillis的区别
+    // System.nanoTime相比System.currentTimeMillis提供相对精确的计时，但是不能用它来计算当前日期
     final long watchStartNanoTime = System.nanoTime();
     String key = UUID.randomUUID().toString();
     retainedKeys.add(key);
+    // 构造带UUID key的弱引用对象
     final KeyedWeakReference reference =
         new KeyedWeakReference(watchedReference, key, referenceName, queue);
 
+    // 确认弱引用对象回收同步
     ensureGoneAsync(watchStartNanoTime, reference);
   }
 
@@ -121,31 +150,43 @@ public final class RefWatcher {
 
   @SuppressWarnings("ReferenceEquality") // Explicitly checking for named null.
   Retryable.Result ensureGone(final KeyedWeakReference reference, final long watchStartNanoTime) {
+    // 记录开始gc的时间（毫秒）
     long gcStartNanoTime = System.nanoTime();
+    // 计算观察期时长（毫秒）
     long watchDurationMs = NANOSECONDS.toMillis(gcStartNanoTime - watchStartNanoTime);
 
+    // 移除弱可达引用
     removeWeaklyReachableReferences();
 
     if (debuggerControl.isDebuggerAttached()) {
       // The debugger can create false leaks.
+      // 调试器可能生成假的内存泄漏
       return RETRY;
     }
     if (gone(reference)) {
+      // 如果弱可达引用不存在 说明不存在内存泄漏
       return DONE;
     }
+    // 执行gc
     gcTrigger.runGc();
+    // 移除弱可达引用结果确认
     removeWeaklyReachableReferences();
     if (!gone(reference)) {
+      // 记录开始“转储堆”的时间（毫秒）
       long startDumpHeap = System.nanoTime();
+      // 计算gc期时长（毫秒）
       long gcDurationMs = NANOSECONDS.toMillis(startDumpHeap - gcStartNanoTime);
 
+      // 执行“堆转储”操作
       File heapDumpFile = heapDumper.dumpHeap();
       if (heapDumpFile == RETRY_LATER) {
         // Could not dump the heap.
         return RETRY;
       }
+      // // 计算“堆转储”期时长（毫秒）
       long heapDumpDurationMs = NANOSECONDS.toMillis(System.nanoTime() - startDumpHeap);
 
+      // 构造“堆转储”信息
       HeapDump heapDump = heapDumpBuilder.heapDumpFile(heapDumpFile).referenceKey(reference.key)
           .referenceName(reference.name)
           .watchDurationMs(watchDurationMs)
@@ -153,19 +194,31 @@ public final class RefWatcher {
           .heapDumpDurationMs(heapDumpDurationMs)
           .build();
 
+      // 执行“堆转储”文件分析
       heapdumpListener.analyze(heapDump);
     }
     return DONE;
   }
 
+  /**
+   * 判断弱可达引用是否消失
+   * @param reference 弱可达引用
+   * @return 弱可达引用是否消失
+   */
   private boolean gone(KeyedWeakReference reference) {
     return !retainedKeys.contains(reference.key);
   }
 
+  /**
+   * 移除弱可达引用
+   */
   private void removeWeaklyReachableReferences() {
     // WeakReferences are enqueued as soon as the object to which they point to becomes weakly
     // reachable. This is before finalization or garbage collection has actually happened.
     KeyedWeakReference ref;
+    // poll，remove区别：
+    // remove() 和 poll() 方法都是从队列中删除第一个元素。remove() 的行为与 Collection 接口的版本相似，
+    // 但是新的 poll() 方法在用空集合调用时不是抛出异常，只是返回 null。因此新的方法更适合容易出现异常条件的情况。
     while ((ref = (KeyedWeakReference) queue.poll()) != null) {
       retainedKeys.remove(ref.key);
     }
