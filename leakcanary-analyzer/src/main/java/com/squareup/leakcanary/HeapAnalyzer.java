@@ -109,6 +109,11 @@ public final class HeapAnalyzer {
     }
   }
 
+  /**
+   * 寻找泄漏踪迹引用-供测试用的
+   * @param heapDumpFile “堆转储”文件
+   * @return 泄漏踪迹引用列表
+   */
   public @NonNull List<TrackedReference> findTrackedReferences(@NonNull File heapDumpFile) {
     if (!heapDumpFile.exists()) {
       throw new IllegalArgumentException("File does not exist: " + heapDumpFile);
@@ -153,10 +158,12 @@ public final class HeapAnalyzer {
   /**
    * Searches the heap dump for a {@link KeyedWeakReference} instance with the corresponding key,
    * and then computes the shortest strong reference path from that instance to the GC roots.
+   * 在“堆转储”文件中用关联键搜索弱引用实例，然后计算这个实例到GC roots的最短强引用路径
    */
   public @NonNull AnalysisResult checkForLeak(@NonNull File heapDumpFile,
       @NonNull String referenceKey,
       boolean computeRetainedSize) {
+    // 记录分析开始时间（毫秒）
     long analysisStartNanoTime = System.nanoTime();
 
     if (!heapDumpFile.exists()) {
@@ -165,13 +172,17 @@ public final class HeapAnalyzer {
     }
 
     try {
+      // 读“堆转储”文件阶段
       listener.onProgressUpdate(READING_HEAP_DUMP_FILE);
       HprofBuffer buffer = new MemoryMappedFileBuffer(heapDumpFile);
       HprofParser parser = new HprofParser(buffer);
+      // 解析“堆转储”阶段
       listener.onProgressUpdate(PARSING_HEAP_DUMP);
       Snapshot snapshot = parser.parse();
+      // GC Root 去重阶段
       listener.onProgressUpdate(DEDUPLICATING_GC_ROOTS);
       deduplicateGcRoots(snapshot);
+      // 寻找泄漏引用阶段
       listener.onProgressUpdate(FINDING_LEAKING_REF);
       Instance leakingRef = findLeakingReference(referenceKey, snapshot);
 
@@ -180,6 +191,7 @@ public final class HeapAnalyzer {
         String className = leakingRef.getClassObj().getClassName();
         return noLeak(className, since(analysisStartNanoTime));
       }
+      // 寻找泄漏踪迹 返回分析结果
       return findLeakTrace(analysisStartNanoTime, snapshot, leakingRef, computeRetainedSize);
     } catch (Throwable e) {
       return failure(e, since(analysisStartNanoTime));
@@ -191,6 +203,7 @@ public final class HeapAnalyzer {
    */
   void deduplicateGcRoots(Snapshot snapshot) {
     // THashMap has a smaller memory footprint than HashMap.
+    // THashMap比HashMap内存占用更少
     final THashMap<String, RootObj> uniqueRootMap = new THashMap<>();
 
     final Collection<RootObj> gcRoots = snapshot.getGCRoots();
@@ -202,6 +215,7 @@ public final class HeapAnalyzer {
     }
 
     // Repopulate snapshot with unique GC roots.
+    // 用去重过的GC roots再填充快照中的GC roots
     gcRoots.clear();
     uniqueRootMap.forEach(new TObjectProcedure<String>() {
       @Override public boolean execute(String key) {
@@ -210,17 +224,31 @@ public final class HeapAnalyzer {
     });
   }
 
+  /**
+   * 生成GC root的key
+   * @param root GC root
+   * @return GC root的key
+   */
   private String generateRootKey(RootObj root) {
     return String.format("%s@0x%08x", root.getRootType().getName(), root.getId());
   }
 
+  /**
+   * 寻找泄漏引用实例
+   * @param key 引用key
+   * @param snapshot 快照
+   * @return 泄漏引用实例
+   */
   private Instance findLeakingReference(String key, Snapshot snapshot) {
+    // 快照中寻找弱引用Class
     ClassObj refClass = snapshot.findClass(KeyedWeakReference.class.getName());
     if (refClass == null) {
       throw new IllegalStateException(
           "Could not find the " + KeyedWeakReference.class.getName() + " class in the heap dump.");
     }
+    // 记录快照中找到的弱引用key集合
     List<String> keysFound = new ArrayList<>();
+    // 遍历弱引用Class的实例对象
     for (Instance instance : refClass.getInstancesList()) {
       List<ClassInstance.FieldValue> values = classInstanceValues(instance);
       Object keyFieldValue = fieldValue(values, "key");
@@ -229,6 +257,7 @@ public final class HeapAnalyzer {
         continue;
       }
       String keyCandidate = asString(keyFieldValue);
+      // 将实例的key字段值与传入的引用key值对比 一致就返回referent字段值
       if (keyCandidate.equals(key)) {
         return fieldValue(values, "referent");
       }
@@ -238,11 +267,21 @@ public final class HeapAnalyzer {
         "Could not find weak reference with key " + key + " in " + keysFound);
   }
 
+  /**
+   * 寻找泄漏踪迹
+   * @param analysisStartNanoTime 分析开始时间（毫秒）
+   * @param snapshot 快照
+   * @param leakingRef 泄漏引用实例
+   * @param computeRetainedSize 是否计算堆剩余大小
+   * @return 泄漏踪迹
+   */
   private AnalysisResult findLeakTrace(long analysisStartNanoTime, Snapshot snapshot,
       Instance leakingRef, boolean computeRetainedSize) {
 
+    // 寻找最短路径阶段
     listener.onProgressUpdate(FINDING_SHORTEST_PATH);
     ShortestPathFinder pathFinder = new ShortestPathFinder(excludedRefs);
+    // 采用类似广度优先搜索的算法，从泄漏引用实例向父节点广度优先搜索
     ShortestPathFinder.Result result = pathFinder.findPath(snapshot, leakingRef);
 
     String className = leakingRef.getClassObj().getClassName();
@@ -252,12 +291,14 @@ public final class HeapAnalyzer {
       return noLeak(className, since(analysisStartNanoTime));
     }
 
+    // 构造泄漏追踪信息
     listener.onProgressUpdate(BUILDING_LEAK_TRACE);
     LeakTrace leakTrace = buildLeakTrace(result.leakingNode);
 
     long retainedSize;
     if (computeRetainedSize) {
 
+      // 计算堆可支配剩余大小阶段
       listener.onProgressUpdate(COMPUTING_DOMINATORS);
       // Side effect: computes retained size.
       snapshot.computeDominators();
@@ -287,11 +328,16 @@ public final class HeapAnalyzer {
    *
    * From experience, we've found that bitmap created in code (Bitmap.createBitmap()) are correctly
    * accounted for, however bitmaps set in layouts are not.
+   * 位图和位图字节数组有时候被native gc roots持有，因此它们不被包含在堆的剩余大小中因为它们的根持有者是
+   * native gc root。
+   * 为了修复这个问题，我们针对每个位图实例来检查泄漏的实例是它们的持有者并且是的话就加上位图大小。
+   * 根据经验，我们发现用代码(Bitmap.createBitmap())生成的位图是正确计算了的，然而在布局中设置的位图并没有。
    */
   private long computeIgnoredBitmapRetainedSize(Snapshot snapshot, Instance leakingInstance) {
     long bitmapRetainedSize = 0;
     ClassObj bitmapClass = snapshot.findClass("android.graphics.Bitmap");
 
+    // 遍历快照中位图Class的所有实例
     for (Instance bitmapInstance : bitmapClass.getInstancesList()) {
       if (isIgnoredDominator(leakingInstance, bitmapInstance)) {
         ArrayInstance mBufferInstance = fieldValue(classInstanceValues(bitmapInstance), "mBuffer");
@@ -312,6 +358,12 @@ public final class HeapAnalyzer {
     return bitmapRetainedSize;
   }
 
+  /**
+   * 是否是可以忽略的持有者
+   * @param dominator 泄漏的持有者
+   * @param instance 位图实例
+   * @return true 可以忽略 false 不可忽略
+   */
   private boolean isIgnoredDominator(Instance dominator, Instance instance) {
     boolean foundNativeRoot = false;
     while (true) {
